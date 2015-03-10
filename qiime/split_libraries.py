@@ -39,6 +39,8 @@ from gzip import GzipFile
 from os import mkdir, stat
 from collections import defaultdict
 from string import upper
+from multiprocessing import Pool
+from functools import partial
 
 from numpy import array, mean, arange, histogram
 from numpy import __version__ as numpy_version
@@ -51,6 +53,7 @@ from cogent import DNA as DNA_cogent, LoadSeqs
 from cogent.align.align import make_dna_scoring_dict, local_pairwise
 from skbio.util import remove_files
 from skbio.sequence import DNASequence
+from cytoolz import assoc
 
 from qiime.check_id_map import process_id_map
 from qiime.barcode import correct_barcode
@@ -500,35 +503,55 @@ def make_histograms(raw_lengths, pre_lengths, post_lengths, binwidth=10):
     return raw_hist, pre_hist, post_hist, bin_edges
 
 
-class SeqQualBad(object):
+def make_seq_data(seqplusidx, qual_mappings, base_index):
+    """
+    take a tuple of (index, seqdata)
+    and return a dictionary with all of the information about a sequence that we will need
 
-    """Checks if a seq and qual score are bad, saving ids that are bad."""
+    :param seqplusdata:
+    :param qual_mappings: a dictionary of qualityscores needed for filter
+    :param base_index: index needed to add to the ids to get the unique sequence index
+    :return:
+    """
 
-    def __init__(self, name, f):
-        """New SeqQualBad keeps track of failed ids."""
-        self.FailedIds = []
-        self.Name = name
-        self.F = f
+    #get basic data
+    idx, seq = seqplusidx
+    curr_ix = base_index + idx
+    curr_id, curr_seq = seq
+    curr_rid = curr_id.split()[0]
+    curr_seq = upper(curr_seq)
+    curr_qual = qual_mappings.get(curr_rid, None)
 
-    def __call__(self, id_, seq, qual):
-        """SeqQualBad called on id, seq and qual returns bool.
+    return {"failed": True,
+            "id": curr_id,
+            "index": curr_ix,
+            "seq": curr_seq,
+            "qual": curr_qual,
+            "raw_seq_length": len(curr_seq),
+            "barcode": None,
+            "primermismatch": None,
+            "fastaout": None,
+            "qualout": None,
+            "raw_barcode": None,
+            "raw_seq": None,
+            "barcode_len": None,
+            "final_seq": None,
+            "final_seq_length": None,
+            # barcode and primer errors
+            "bc_counts": False,
+            "corrected_barcode": 0,
+            "reverse_primer_not_found": 0,
+            "sliding_window_failed": 0,
+            "below_sequence_min_after_trunc": 0,
+            "primer_mismatch_count": 0,
+            "trunc_ambi_base_counts": 0,
+            #quality filters
+            "check_trim": False,
+            "check_ambig": False,
+            "check_qual": False,
+            "check_meanqual": False,
+            "check_homopolymer": False}
 
-        Note: saves failed ids in self.FailedIds."""
-        result = self.F(id_, seq, qual)
-        if result:
-            self.FailedIds.append(id_)
-        return result
-
-    def __str__(self):
-        """SeqQualBad str returns tab-delimited output of counts."""
-        return "%s\t%s" % (self.Name, len(self.FailedIds))
-
-
-def qual_missing(id_, seq, qual):
-    """returns True if qual is None"""
-    return qual is None
-
-QualMissing = SeqQualBad('Missing Qual Score', qual_missing)
 
 
 def get_seq_lengths(seq_lengths, bc_counts):
@@ -548,7 +571,7 @@ def check_window_qual_scores(qual_scores, window=50, min_average=25):
     l = len(qual_scores)
 
     window = min(window, l)
-    if (window == 0):
+    if window == 0:
         return True
     # initialize with sum of first window
     window_score = sum(qual_scores[:window])
@@ -558,7 +581,7 @@ def check_window_qual_scores(qual_scores, window=50, min_average=25):
             #'Move' window
         window_score += qual_scores[idx + window] - qual_scores[idx]
         idx += 1
-    if (idx == l - window):
+    if idx == l - window:
         # we processed all qual_scores, must be good
         # Return index for truncation purposes
         return True, idx
@@ -566,307 +589,429 @@ def check_window_qual_scores(qual_scores, window=50, min_average=25):
         return False, idx
 
 
-def check_seqs(fasta_out, fasta_files, starting_ix, valid_map, qual_mappings,
-               filters, barcode_len, keep_primer, keep_barcode, barcode_type,
-               max_bc_errors, retain_unassigned_reads, attempt_bc_correction,
-               primer_seqs_lens, all_primers, max_primer_mm, disable_primer_check,
-               reverse_primers, rev_primers, qual_out, qual_score_window=0,
-               discard_bad_windows=False, min_qual_score=25, min_seq_len=200,
-               median_length_filtering=None, added_demultiplex_field=None,
-               reverse_primer_mismatches=0, truncate_ambi_bases=False):
+def check_seq(seqdict, valid_map, barcode_len, keep_primer,
+              keep_barcode, barcode_type, max_bc_errors, retain_unassigned_reads,
+              attempt_bc_correction, primer_seqs_lens, all_primers, max_primer_mm, disable_primer_check,
+              reverse_primers, rev_primers, qual_out, qual_score_window, discard_bad_windows, min_seq_len,
+              added_demultiplex_field, reverse_primer_mismatches, truncate_ambi_bases, barcode_length_order,
+              all_primers_lens, min_qual_score):
+    """
+    take a dict with sequence information and process it for barcode info
+
+    if all quality checks pass, set failed to False and return data as dict.
+
+    """
+
+    #return if any of the filter flags are not True
+    for x in ['check_trim','check_ambig','check_qual','check_meanqual','check_homopolymer']:
+        if seqdict[x]: return seqdict
+
+    #get basic data
+    curr_ix = seqdict['index']
+    curr_id = seqdict['id']
+    curr_seq = seqdict['seq']
+    curr_rid = curr_id.split()[0]
+    #curr_seq = upper(curr_seq)
+    curr_qual = seqdict['qual']
+
+    #return the updated dictionary
+    returndata = seqdict
+
+    if barcode_type == 'variable_length':
+        # Reset the raw_barcode, raw_seq, and barcode_len -- if
+        # we don't match a barcode from the mapping file, we want
+        # these values to be None
+        curr_valid_map = \
+            [curr_bc.split(',')[0] for curr_bc in valid_map]
+        # Iterate through the barcode length from longest to shortest
+        for l in barcode_length_order:
+            # extract the current length barcode from the sequence
+            bc, seq = get_barcode(curr_seq, l)
+            # check if the sliced sequence corresponds to a valid
+            # barcode, and if so set raw_barcode, raw_seq, and
+            # barcode_len for use in the next steps
+            if bc in curr_valid_map:
+                raw_barcode, raw_seq = bc, seq
+                barcode_len = len(raw_barcode)
+                returndata['raw_barcode'] = raw_barcode
+                returndata['raw_seq'] = raw_seq
+                returndata['barcode_len'] = len(raw_barcode)
+                break
+        # if we haven't found a valid barcode, log this sequence as
+        # failing to match a barcode, and move on to the next sequence
+        if not raw_barcode:
+            return returndata
+
+    else:
+        # Get the current barcode to look up the associated primer(s)
+        raw_barcode, raw_seq = get_barcode(curr_seq, barcode_len)
+        returndata['raw_barcode'] = raw_barcode
+        returndata['raw_seq'] = raw_seq
+
+    if not disable_primer_check:
+        try:
+            current_primers = primer_seqs_lens[raw_barcode]
+            # In this case, all values will be the same, i.e. the length
+            # of the given primer, or degenerate variations thereof.
+            primer_len = current_primers.values()[0]
+
+            if primer_exceeds_mismatches(raw_seq[:primer_len],
+                                         current_primers, max_primer_mm):
+                # bc_counts['#FAILED'].append(curr_rid)
+                #primer_mismatch_count += 1
+                returndata['barcode'] = "#FAILED"
+                returndata['primer_mismatch_count'] += 1
+                #continue
+        except KeyError:
+            # If the barcode read does not match any of those in the
+            # mapping file, the situation becomes more complicated.  We do
+            # not know the length the sequence to slice out to compare to
+            # our primer sets, so, in ascending order of all the given
+            # primer lengths, a sequence will the sliced out and compared
+            # to the primer set.
+            current_primers = all_primers
+            found_match = False
+            for seq_slice_len in all_primers_lens:
+                if not (primer_exceeds_mismatches(raw_seq[:seq_slice_len],
+                                                  current_primers, max_primer_mm)):
+                    primer_len = seq_slice_len
+                    found_match = True
+                    break
+            if not found_match:
+                returndata["barcode"] = "#FAILED"
+                returndata['primer_mismatch_count'] += 1
+                return returndata
+
+        except IndexError:
+            # Try to raise meaningful error if problem reading primers
+            raise IndexError('Error reading primer sequences.  If ' +
+                             'primers were purposefully not included in the mapping ' +
+                             'file, disable usage with the -p option.')
+    else:
+        # Set primer length to zero if primers are disabled.
+        primer_len = 0
+
+    # split seqs
+    cbc, cpr, cres = split_seq(curr_seq, barcode_len, primer_len)
+    total_bc_primer_len = len(cbc) + len(cpr)
+
+    # get current barcode
+    try:
+        bc_diffs, curr_bc, corrected_bc = \
+            check_barcode(cbc, barcode_type, valid_map.keys(),
+                          attempt_bc_correction, added_demultiplex_field, curr_id)
+        if bc_diffs > max_bc_errors:
+            raise ValueError("Too many errors in barcode")
+        returndata['corrected_barcode'] +=1
+    except Exception as e:
+        returndata['bc_counts'] = None
+        return returndata
+
+    curr_samp_id = valid_map.get(curr_bc, 'Unassigned')
+    new_id = "%s_%d" % (curr_samp_id, curr_ix)
+    # check if writing out primer
+    write_seq = cres
+
+    if reverse_primers == "truncate_only":
+        try:
+            rev_primer = rev_primers[curr_bc]
+            mm_tested = {}
+            for curr_rev_primer in rev_primer:
+                # Try to find lowest count of mismatches for all
+                # reverse primers
+                rev_primer_mm, rev_primer_index = \
+                    local_align_primer_seq(curr_rev_primer, cres)
+                mm_tested[rev_primer_mm] = rev_primer_index
+
+            rev_primer_mm = min(mm_tested.keys())
+            rev_primer_index = mm_tested[rev_primer_mm]
+            if rev_primer_mm <= reverse_primer_mismatches:
+                write_seq = write_seq[0:rev_primer_index]
+                if qual_out:
+                    curr_qual = curr_qual[0:barcode_len +
+                                            primer_len + rev_primer_index]
+            else:
+                returndata['reverse_primer_not_found'] += 1
+                #reverse_primer_not_found += 1
+        except KeyError:
+            pass
+    elif reverse_primers == "truncate_remove":
+        try:
+            rev_primer = rev_primers[curr_bc]
+            mm_tested = {}
+            for curr_rev_primer in rev_primer:
+                # Try to find lowest count of mismatches for all
+                # reverse primers
+                rev_primer_mm, rev_primer_index = \
+                    local_align_primer_seq(curr_rev_primer, cres)
+                mm_tested[rev_primer_mm] = rev_primer_index
+
+            rev_primer_mm = min(mm_tested.keys())
+            rev_primer_index = mm_tested[rev_primer_mm]
+            if rev_primer_mm <= reverse_primer_mismatches:
+                write_seq = write_seq[0:rev_primer_index]
+                if qual_out:
+                    curr_qual = curr_qual[0:barcode_len + primer_len + rev_primer_index]
+            else:
+                returndata['reverse_primer_not_found'] +=1
+                write_seq = False
+        except KeyError:
+            returndata['barcode'] = "#FAILED"
+            return returndata
+
+    # Check for quality score windows, truncate or remove sequence
+    # if poor window found.  Previously tested whole sequence-now
+    # testing the post barcode/primer removed sequence only.
+    if qual_score_window:
+        passed_window_check, window_index = \
+            check_window_qual_scores(curr_qual, qual_score_window, min_qual_score)
+        # Throw out entire sequence if discard option True
+        if discard_bad_windows and not passed_window_check:
+            returndata['sliding_window_failed'] += 1
+            write_seq = False
+        # Otherwise truncate to index of bad window
+        elif not discard_bad_windows and not passed_window_check:
+            returndata['sliding_window_failed'] += 1
+            if write_seq:
+                write_seq = write_seq[0:window_index]
+                if qual_out:
+                    curr_qual = curr_qual[0:barcode_len +
+                                            primer_len + window_index]
+                # Check for sequences that are too short after truncation
+                if (len(write_seq) + total_bc_primer_len) < min_seq_len:
+                    write_seq = False
+                    returndata['below_sequence_min_after_trunc'] += 1
+
+    if truncate_ambi_bases and write_seq:
+        write_seq_ambi_ix = True
+        # Skip if no "N" characters detected.
+        try:
+            ambi_ix = write_seq.index("N")
+            write_seq = write_seq[0:ambi_ix]
+        except ValueError:
+            write_seq_ambi_ix = False
+            pass
+        if write_seq_ambi_ix:
+            # Discard if too short after truncation
+            if len(write_seq) + total_bc_primer_len < min_seq_len:
+                write_seq = False
+                returndata['below_sequence_min_after_trunc'] += 1
+            else:
+                returndata['trunc_ambi_base_counts'] += 1
+                #trunc_ambi_base_counts += 1
+                if qual_out:
+                    curr_qual = curr_qual[0:barcode_len + primer_len + ambi_ix]
+
+    # Slice out regions of quality scores that correspond to the
+    # written sequence, i.e., remove the barcodes/primers and reverse
+    # primers if option is enabled.
+    if qual_out:
+        qual_barcode, qual_primer, qual_scores_out = \
+            split_seq(curr_qual, barcode_len, primer_len)
+        # Convert to strings instead of numpy arrays, strip off
+        # brackets
+        qual_barcode = format_qual_output(qual_barcode)
+        qual_primer = format_qual_output(qual_primer)
+        qual_scores_out = format_qual_output(qual_scores_out)
+
+    if not write_seq:
+        returndata['barcode'] = "#FAILED"
+        return returndata
+
+    if keep_primer:
+        write_seq = cpr + write_seq
+        if qual_out:
+            qual_scores_out = qual_primer + qual_scores_out
+    if keep_barcode:
+        write_seq = cbc + write_seq
+        if qual_out:
+            qual_scores_out = qual_barcode + qual_scores_out
+
+    # Record number of seqs associated with particular barcode.
+    #bc_counts[curr_bc].append(curr_rid)
+
+    if retain_unassigned_reads and curr_samp_id == "Unassigned":
+        returndata['failed'] = False
+        returndata['fastaout'] = ">{} {} orig_bc={} new_bc={} bc_diffs={}\n{}\n".format(
+            new_id, curr_rid, cbc, curr_bc, int(bc_diffs), write_seq)
+
+        if qual_out:
+            returndata['qualout'] = ">{} {} orig_bc={} new_bc={} bc_diffs={}\n{}\n".format(
+            new_id, curr_rid, cbc, curr_bc, int(bc_diffs), qual_scores_out)
+
+    elif not retain_unassigned_reads and curr_samp_id == "Unassigned":
+        return returndata
+    else:
+        returndata['failed'] = False
+        returndata['fastaout'] = ">{} {} orig_bc={} new_bc={} bc_diffs={}\n{}\n".format(
+            new_id, curr_rid, cbc, curr_bc, int(bc_diffs), write_seq)
+
+    if qual_out:
+        returndata['qualout'] = ">{} {} orig_bc={} new_bc={} bc_diffs={}\n{}\n".format(
+            new_id, curr_rid, cbc, curr_bc, int(bc_diffs), qual_scores_out)
+
+    curr_len = len(write_seq)
+    returndata['barcode'] = curr_bc
+    returndata['final_seq_length'] = curr_len
+    return returndata
+
+### Functions that will return a filter function
+### all of these functions take a dictionary whose values are
+### specified in the the make_seq_data() function, make a test and modify a key
+
+def make_trim_filter(min_seq_len, max_seq_len, trim):
+    """True if sequence length outside bounds of min_seq_len and max_seq_len"""
+    def fn(seqdict):
+        val = not (min_seq_len <= len(seqdict['seq']) - trim <= max_seq_len)
+        return assoc(seqdict, 'check_trim' , val)
+    return fn
+
+def make_ambig_filter(max_ambig):
+    """True if num ambiguous bases exceeds limit of max_ambig"""
+    def fn(seqdict):
+        val = count_ambig(seqdict['seq']) > max_ambig
+        return assoc(seqdict, 'check_ambig', val)
+    return fn
+
+def make_qual_filter():
+    """returns True if qual is None"""
+    def fn(seqdict):
+        val = seqdict['qual']
+        return assoc(seqdict, 'check_qual', val)
+    return fn
+
+def make_meanqual_filter(min_qual_score):
+    """True if mean qual score below minimum of min_qual_score"""
+    def fn(seqdict):
+        val = mean( seqdict['qual']) < min_qual_score
+        return assoc(seqdict, 'check_meanqual', val)
+    return fn
+
+
+def make_homopolymer_filter(max_homopolymer, barcode_len):
+    def fn(seqdict):
+        """True if max homopolymer run exceeds limit of max_homopolymer"""
+        seq = seqdict['seq']
+        val = seq_exceeds_homopolymers(seq[barcode_len:], max_homopolymer)
+        return assoc(seqdict, 'check_homopolymer',val)
+    return fn
+
+
+def check_seqs(fasta_out, fasta_files, starting_ix, valid_map, qual_mappings, keep_primer, barcode_len,
+               keep_barcode, barcode_type, max_bc_errors, retain_unassigned_reads, attempt_bc_correction,
+               primer_seqs_lens, all_primers, max_primer_mm, disable_primer_check, reverse_primers, rev_primers,
+               qual_out,  max_seq_len, max_homopolymer, max_ambig,qual_score_window=0, discard_bad_windows=False,
+               min_qual_score=25, min_seq_len=200, median_length_filtering=None, added_demultiplex_field=None,
+               reverse_primer_mismatches=0, truncate_ambi_bases=False, ncpus=1, check_trim=None, check_ambig=None,
+               check_qual=None,check_meanqual=None, check_homopolymer=None):
+
     """Checks fasta-format sequences and qual files for validity."""
-
     seq_lengths = {}
-
     # Record complete barcode + primer + sequence lengths
     raw_seq_lengths = {}
     # Record sequence lengths after all optional removal of components
     final_seq_lengths = {}
-
     bc_counts = defaultdict(list)
-    curr_ix = starting_ix
-    corr_ct = 0  # count of corrected barcodes
-
-    # get the list of barcode lengths in reverse order
-    barcode_length_order =\
-        sorted(set([len(bc.split(',')[0]) for bc in valid_map]))
+    barcode_length_order = sorted(set([len(bc.split(',')[0]) for bc in valid_map]))
     barcode_length_order = barcode_length_order[::-1]
-
-    primer_mismatch_count = 0
     all_primers_lens = sorted(set(all_primers.values()))
 
+    # all of these things will need to be kept track of
+    corr_ct = 0
+    primer_mismatch_count = 0
     reverse_primer_not_found = 0
-
     sliding_window_failed = 0
     trunc_ambi_base_counts = 0
-
     below_seq_min_after_trunc = 0
     below_seq_min_after_ambi_trunc = 0
+    trim_check = 0
+    ambig_check = 0
+    qual_check = 0
+    meanqual_check = 0
+    homopolymer_check = 0
 
+    #use the base index to keep track in the index.
+    #enumerate will generate a new number for each sequence but inside the iterator
+    base_index = starting_ix
     for fasta_in in fasta_files:
-        for curr_id, curr_seq in parse_fasta(fasta_in):
-            curr_rid = curr_id.split()[0]
-            curr_seq = upper(curr_seq)
 
-            curr_len = len(curr_seq)
-            curr_qual = qual_mappings.get(curr_rid, None)
+        #create pool of processes to use
+        p = Pool(processes=ncpus)
+        #lazily iterate an index and sequence from the fastafile
+        seqs = (s for s in enumerate(parse_fasta(fasta_in)))
 
-            # if qual_out:
-            #    curr_qual_out_score = \
-            #     "%2.2f" % float(float(sum(curr_qual))/float(len(curr_qual)))
-            seq_lengths[curr_rid] = curr_len
-            failed = False
 
-            for f in filters:
-                failed = failed or f(curr_rid, curr_seq, curr_qual)
-            if failed:  # if we failed any of the checks, bail out here
-                bc_counts['#FAILED'].append(curr_rid)
-                continue
+        #turn into sequence dicts that can be passed along
+        handle_data = partial(make_seq_data,
+                              base_index=base_index,
+                              qual_mappings=qual_mappings)
 
-            if barcode_type == 'variable_length':
-                # Reset the raw_barcode, raw_seq, and barcode_len -- if
-                # we don't match a barcode from the mapping file, we want
-                # these values to be None
-                raw_barcode, raw_seq, barcode_len = (None, None, None)
+        #don't use multiptocessing here because qual_mappings is a big file
+        seqdata = (handle_data(s) for s in seqs)
 
-                curr_valid_map =\
-                    [curr_bc.split(',')[0] for curr_bc in valid_map]
-                # Iterate through the barcode length from longest to shortest
-                for l in barcode_length_order:
-                    # extract the current length barcode from the sequence
-                    bc, seq = get_barcode(curr_seq, l)
-                    # check if the sliced sequence corresponds to a valid
-                    # barcode, and if so set raw_barcode, raw_seq, and
-                    # barcode_len for use in the next steps
-                    if bc in curr_valid_map:
-                        raw_barcode, raw_seq = bc, seq
-                        barcode_len = len(raw_barcode)
-                        break
-                # if we haven't found a valid barcode, log this sequence as
-                # failing to match a barcode, and move on to the next sequence
-                if not raw_barcode:
-                    bc_counts['#FAILED'].append(curr_rid)
-                    continue
+        #filterdata with filter functions
+        if check_trim:
+            seqdata = (check_trim(s) for s in seqdata)
+        if check_ambig:
+            seqdata = (check_ambig(s) for s in seqdata)
+        if check_qual:
+            seqdata = (check_ambig(s) for s in seqdata)
+        if check_meanqual:
+            seqdata = (check_ambig(s) for s in seqdata)
+        if check_homopolymer:
+            seqdata = (check_homopolymer(s) for s in seqdata)
 
-            else:
-                # Get the current barcode to look up the associated primer(s)
-                raw_barcode, raw_seq = get_barcode(curr_seq, barcode_len)
+        # process the computationally intensive/low-memory bits in parallel
+        process_seq = partial(check_seq, valid_map=valid_map, keep_primer=keep_primer,
+                              barcode_len=barcode_len,
+                              keep_barcode=keep_barcode, barcode_type=barcode_type, max_bc_errors=max_bc_errors,
+                              retain_unassigned_reads=retain_unassigned_reads,
+                              attempt_bc_correction=attempt_bc_correction, primer_seqs_lens=primer_seqs_lens,
+                              all_primers=all_primers, max_primer_mm=max_primer_mm,
+                              disable_primer_check=disable_primer_check, reverse_primers=reverse_primers,
+                              rev_primers=rev_primers, qual_out=qual_out, qual_score_window=qual_score_window,
+                              discard_bad_windows=discard_bad_windows, min_qual_score=min_qual_score,
+                              min_seq_len=min_seq_len, added_demultiplex_field=added_demultiplex_field,
+                              reverse_primer_mismatches=reverse_primer_mismatches,
+                              truncate_ambi_bases=truncate_ambi_bases, barcode_length_order=barcode_length_order,
+                              all_primers_lens=all_primers_lens)
 
-            if not disable_primer_check:
-                try:
-                    current_primers = primer_seqs_lens[raw_barcode]
-                    # In this case, all values will be the same, i.e. the length
-                    # of the given primer, or degenerate variations thereof.
-                    primer_len = current_primers.values()[0]
 
-                    if primer_exceeds_mismatches(raw_seq[:primer_len],
-                                                 current_primers, max_primer_mm):
-                        bc_counts['#FAILED'].append(curr_rid)
-                        primer_mismatch_count += 1
-                        continue
-                except KeyError:
-                    # If the barcode read does not match any of those in the
-                    # mapping file, the situation becomes more complicated.  We do
-                    # not know the length the sequence to slice out to compare to
-                    # our primer sets, so, in ascending order of all the given
-                    # primer lengths, a sequence will the sliced out and compared
-                    # to the primer set.
-                    current_primers = all_primers
-                    found_match = False
-                    for seq_slice_len in all_primers_lens:
-                        if not(
-                            primer_exceeds_mismatches(raw_seq[:seq_slice_len],
-                                                      current_primers, max_primer_mm)):
-                            primer_len = seq_slice_len
-                            found_match = True
-                            break
-                    if not found_match:
-                        bc_counts['#FAILED'].append(curr_rid)
-                        primer_mismatch_count += 1
-                        continue
-                except IndexError:
-                    # Try to raise meaningful error if problem reading primers
-                    raise IndexError('Error reading primer sequences.  If ' +
-                                     'primers were purposefully not included in the mapping ' +
-                                     'file, disable usage with the -p option.')
-            else:
-                # Set primer length to zero if primers are disabled.
-                primer_len = 0
+        processed_seqs = p.imap_unordered(process_seq, seqdata)
 
-            # split seqs
-            cbc, cpr, cres = split_seq(curr_seq, barcode_len,
-                                       primer_len)
+        for seqdata in processed_seqs:
+            #update the iterator index
+            #won't affect the first round but will affect subsequent rounds
+            base_index +=1
 
-            total_bc_primer_len = len(cbc) + len(cpr)
+            #sequence lengths
+            seq_lengths[seqdata['id']] = seqdata['raw_seq_length']
+            raw_seq_lengths[seqdata['id']] = seqdata['raw_seq_length']
+            final_seq_lengths[seqdata['id']] = seqdata['final_seq_length']
 
-            # get current barcode
-            try:
-                bc_diffs, curr_bc, corrected_bc = \
-                    check_barcode(cbc, barcode_type, valid_map.keys(),
-                                  attempt_bc_correction, added_demultiplex_field, curr_id)
-                if bc_diffs > max_bc_errors:
-                    raise ValueError("Too many errors in barcode")
-                corr_ct += bool(corrected_bc)
-            except Exception as e:
-                bc_counts[None].append(curr_rid)
-                continue
+            #update barcode  info including those that failed
+            bc_counts[seqdata['barcode']].append(seqdata['id'])
 
-            curr_samp_id = valid_map.get(curr_bc, 'Unassigned')
+            corr_ct                   += seqdata['corrected_barcode']
+            reverse_primer_not_found  += seqdata['reverse_primer_not_found']
+            below_seq_min_after_trunc += seqdata['below_sequence_min_after_trunc']
+            sliding_window_failed     += seqdata['sliding_window_failed']
 
-            new_id = "%s_%d" % (curr_samp_id, curr_ix)
-            # check if writing out primer
-            write_seq = cres
+            #update filter fail counts
+            if seqdata['check_trim']:        trim_check += 1
+            if seqdata['check_ambig']:       ambig_check += 1
+            if seqdata['check_qual']:        qual_check += 1
+            if seqdata['check_meanqual']:    meanqual_check += 1
+            if seqdata['check_homopolymer']: homopolymer_check += 1
 
-            if reverse_primers == "truncate_only":
-                try:
-                    rev_primer = rev_primers[curr_bc]
-                    mm_tested = {}
-                    for curr_rev_primer in rev_primer:
-                        # Try to find lowest count of mismatches for all
-                        # reverse primers
-                        rev_primer_mm, rev_primer_index  = \
-                            local_align_primer_seq(curr_rev_primer, cres)
-                        mm_tested[rev_primer_mm] = rev_primer_index
+            if seqdata['primer_mismatch_count']:
+                primer_mismatch_count += seqdata['primer_mismatch_count']
 
-                    rev_primer_mm = min(mm_tested.keys())
-                    rev_primer_index = mm_tested[rev_primer_mm]
-                    if rev_primer_mm <= reverse_primer_mismatches:
-                        write_seq = write_seq[0:rev_primer_index]
-                        if qual_out:
-                            curr_qual = curr_qual[0:barcode_len +
-                                                  primer_len + rev_primer_index]
-                    else:
-                        reverse_primer_not_found += 1
-                except KeyError:
-                    pass
-            elif reverse_primers == "truncate_remove":
-                try:
-                    rev_primer = rev_primers[curr_bc]
-                    mm_tested = {}
-                    for curr_rev_primer in rev_primer:
-                        # Try to find lowest count of mismatches for all
-                        # reverse primers
-                        rev_primer_mm, rev_primer_index  = \
-                            local_align_primer_seq(curr_rev_primer, cres)
-                        mm_tested[rev_primer_mm] = rev_primer_index
-
-                    rev_primer_mm = min(mm_tested.keys())
-                    rev_primer_index = mm_tested[rev_primer_mm]
-                    if rev_primer_mm <= reverse_primer_mismatches:
-                        write_seq = write_seq[0:rev_primer_index]
-                        if qual_out:
-                            curr_qual = curr_qual[0:barcode_len +
-                                                  primer_len + rev_primer_index]
-                    else:
-                        reverse_primer_not_found += 1
-                        write_seq = False
-                except KeyError:
-                    bc_counts['#FAILED'].append(curr_rid)
-                    continue
-
-            # Check for quality score windows, truncate or remove sequence
-            # if poor window found.  Previously tested whole sequence-now
-            # testing the post barcode/primer removed sequence only.
-            if qual_score_window:
-                passed_window_check, window_index =\
-                    check_window_qual_scores(curr_qual, qual_score_window,
-                                             min_qual_score)
-                # Throw out entire sequence if discard option True
-                if discard_bad_windows and not passed_window_check:
-                    sliding_window_failed += 1
-                    write_seq = False
-                # Otherwise truncate to index of bad window
-                elif not discard_bad_windows and not passed_window_check:
-                    sliding_window_failed += 1
-                    if write_seq:
-                        write_seq = write_seq[0:window_index]
-                        if qual_out:
-                            curr_qual = curr_qual[0:barcode_len +
-                                primer_len + window_index]
-                        #Check for sequences that are too short after truncation
-                        if len(write_seq) + total_bc_primer_len < min_seq_len:
-                            write_seq = False
-                            below_seq_min_after_trunc += 1
-
-            if truncate_ambi_bases and write_seq:
-                write_seq_ambi_ix = True
-                # Skip if no "N" characters detected.
-                try:
-                    ambi_ix = write_seq.index("N")
-                    write_seq = write_seq[0:ambi_ix]
-                except ValueError:
-                    write_seq_ambi_ix = False
-                    pass
-                if write_seq_ambi_ix:
-                    # Discard if too short after truncation
-                    if len(write_seq) + total_bc_primer_len < min_seq_len:
-                        write_seq = False
-                        below_seq_min_after_ambi_trunc += 1
-                    else:
-                        trunc_ambi_base_counts += 1
-                        if qual_out:
-                            curr_qual = curr_qual[0:barcode_len +
-                                                  primer_len + ambi_ix]
-
-            # Slice out regions of quality scores that correspond to the
-            # written sequence, i.e., remove the barcodes/primers and reverse
-            # primers if option is enabled.
-            if qual_out:
-                qual_barcode, qual_primer, qual_scores_out = \
-                    split_seq(curr_qual, barcode_len, primer_len)
-                # Convert to strings instead of numpy arrays, strip off
-                # brackets
-                qual_barcode = format_qual_output(qual_barcode)
-                qual_primer = format_qual_output(qual_primer)
-                qual_scores_out = format_qual_output(qual_scores_out)
-
-            if not write_seq:
-                bc_counts['#FAILED'].append(curr_rid)
-                continue
-
-            if keep_primer:
-                write_seq = cpr + write_seq
+            #check to see if the sequence failed checks and write out the result
+            if seqdata['failed'] == False:
+                fasta_out.write( seqdata['fastaout'] )
                 if qual_out:
-                    qual_scores_out = qual_primer + qual_scores_out
-            if keep_barcode:
-                write_seq = cbc + write_seq
-                if qual_out:
-                    qual_scores_out = qual_barcode + qual_scores_out
-
-            # Record number of seqs associated with particular barcode.
-            bc_counts[curr_bc].append(curr_rid)
-
-            if retain_unassigned_reads and curr_samp_id == "Unassigned":
-                fasta_out.write(
-                    ">%s %s orig_bc=%s new_bc=%s bc_diffs=%s\n%s\n" %
-                    (new_id, curr_rid, cbc, curr_bc, int(bc_diffs), write_seq))
-                if qual_out:
-                    qual_out.write(
-                        ">%s %s orig_bc=%s new_bc=%s bc_diffs=%s\n%s" %
-                        (new_id, curr_rid, cbc, curr_bc, int(bc_diffs),
-                         qual_scores_out))
-            elif not retain_unassigned_reads and curr_samp_id == "Unassigned":
-                bc_counts['#FAILED'].append(curr_rid)
-            else:
-                fasta_out.write(
-                    ">%s %s orig_bc=%s new_bc=%s bc_diffs=%s\n%s\n" %
-                    (new_id, curr_rid, cbc, curr_bc, int(bc_diffs), write_seq))
-                if qual_out:
-                    qual_out.write(
-                        ">%s %s orig_bc=%s new_bc=%s bc_diffs=%s\n%s" %
-                        (new_id, curr_rid, cbc, curr_bc, int(bc_diffs),
-                         qual_scores_out))
-
-            curr_len = len(write_seq)
-
-            #seq_lengths[curr_rid] = curr_len
-
-            curr_ix += 1
-
-            # Record the raw and written seq length of everything passing
-            # filters
-            raw_seq_lengths[curr_rid] = len(curr_seq)
-            final_seq_lengths[curr_id] = curr_len
+                    qual_out.write( seqdata['qualout'])
 
     if median_length_filtering:
         # Read original fasta file output to get sequence lengths
@@ -874,9 +1019,8 @@ def check_seqs(fasta_out, fasta_files, starting_ix, valid_map, qual_mappings,
         fasta_out = open(fasta_out.name, "U")
 
         # Record sequence lengths for median/mad calculation
-        sequence_lens = []
-        for label, seq in parse_fasta(fasta_out):
-            sequence_lens.append(len(seq))
+        sequence_lens = [len(seq) for label,seq in parse_fasta(fasta_out)]
+
 
         '''# Create a temporary file to copy the contents of the fasta file, will
         # need to delete once operations complete.
@@ -896,12 +1040,9 @@ def check_seqs(fasta_out, fasta_files, starting_ix, valid_map, qual_mappings,
 
         med_abs_dev, med_length = median_absolute_deviation(sequence_lens)
 
-        min_corrected_len = med_length - med_abs_dev *\
-            float(median_length_filtering)
-        max_corrected_len = med_length + med_abs_dev *\
-            float(median_length_filtering)
+        min_corrected_len = med_length - med_abs_dev * float(median_length_filtering)
+        max_corrected_len = med_length + med_abs_dev * float(median_length_filtering)
         seqs_discarded_median = 0
-
         fasta_out.seek(0)
 
         final_written_lens = []
@@ -944,19 +1085,27 @@ def check_seqs(fasta_out, fasta_files, starting_ix, valid_map, qual_mappings,
     median_results = (median_length_filtering, min_corrected_len,
                       max_corrected_len, seqs_discarded_median, final_written_lens)
 
-    raw_seq_lengths = raw_seq_lengths.values()
-    final_seq_lengths = final_seq_lengths.values()
+    raw_seq_lengths = [v for v in raw_seq_lengths.values() if v is not None]
+    final_seq_lengths = [v for v in final_seq_lengths.values() if v is not None]
 
-    log_out = format_log(bc_counts, corr_ct, valid_map, seq_lengths, filters,
-                         retain_unassigned_reads, attempt_bc_correction, primer_mismatch_count,
-                         max_primer_mm, reverse_primers, reverse_primer_not_found,
-                         sliding_window_failed, below_seq_min_after_trunc, qual_score_window,
-                         discard_bad_windows, min_seq_len, raw_seq_lengths,
-                         final_seq_lengths, median_results, truncate_ambi_bases,
-                         below_seq_min_after_ambi_trunc, )
+    log_out = format_log(bc_counts=bc_counts, corr_ct=corr_ct, valid_map=valid_map, seq_lengths=seq_lengths,
+                         retain_unassigned_reads=retain_unassigned_reads,
+                         attempt_bc_correction=attempt_bc_correction, primer_mismatch_count=primer_mismatch_count,
+                         max_primer_mm=max_primer_mm, reverse_primers=reverse_primers,
+                         reverse_primer_not_found=reverse_primer_not_found,
+                         sliding_window_failed=sliding_window_failed,
+                         below_seq_min_after_trunc=below_seq_min_after_trunc,
+                         qual_score_window=qual_score_window, discard_bad_windows=discard_bad_windows,
+                         min_seq_len=min_seq_len, raw_seq_lengths=raw_seq_lengths,
+                         final_seq_lengths=final_seq_lengths, median_results=median_results,
+                         truncate_ambi_bases=truncate_ambi_bases,
+                         below_seq_min_after_ambi_trunc=below_seq_min_after_ambi_trunc,
+                         trim_check=trim_check, ambig_check=ambig_check, qual_check=qual_check,
+                         meanqual_check=meanqual_check, homopolymer_check=homopolymer_check,
+                         max_seq_len=max_seq_len, min_qual_score=min_qual_score,
+                         max_homopolymer=max_homopolymer, max_ambig=max_ambig)
 
     #all_seq_lengths, good_seq_lengths = get_seq_lengths(seq_lengths, bc_counts)
-
     return log_out, seq_lengths.values(), raw_seq_lengths, final_seq_lengths
 
 
@@ -981,15 +1130,12 @@ def format_qual_output(qual_array):
     return qual_scores
 
 
-def format_log(bc_counts, corr_ct, valid_map, seq_lengths, filters,
-               retain_unassigned_reads, attempt_bc_correction,
-               primer_mismatch_count, max_primer_mm,
-               reverse_primers, reverse_primer_not_found, sliding_window_failed,
-               below_seq_min_after_trunc, qual_score_window,
-               discard_bad_windows, min_seq_len,
-               raw_seq_lengths, final_seq_lengths, median_results=(None),
-               truncate_ambi_bases=False, below_seq_min_after_ambi_trunc=0,
-               ):
+def format_log(bc_counts, corr_ct, valid_map, seq_lengths, retain_unassigned_reads, attempt_bc_correction,
+               primer_mismatch_count, max_primer_mm, reverse_primers, reverse_primer_not_found, sliding_window_failed,
+               below_seq_min_after_trunc, qual_score_window, discard_bad_windows, raw_seq_lengths,
+               final_seq_lengths, median_results, trim_check, ambig_check, qual_check, meanqual_check,
+               homopolymer_check,min_seq_len, max_seq_len, min_qual_score, max_ambig,
+               max_homopolymer, truncate_ambi_bases=False, below_seq_min_after_ambi_trunc=0):
     """Makes log lines"""
     log_out = []
     all_seq_lengths, good_seq_lengths = get_seq_lengths(seq_lengths, bc_counts)
@@ -1012,8 +1158,22 @@ def format_log(bc_counts, corr_ct, valid_map, seq_lengths, filters,
                             int(median_results[3])))
             actual_median_results = True
 
-    for f in filters:
-        log_out.append(str(f))
+    if trim_check:
+        log_out.append("Number of Sequences with Length outside bounds of {} and {} : {}\n".format(
+            min_seq_len, max_seq_len,trim_check))
+    if ambig_check:
+        log_out.append("Number of Sequences with Num ambiguous bases exceeding limit of {}: {}\n".format(
+            max_ambig,ambig_check))
+    #if qual_check:
+    #    log_out.append("")
+    #    pass
+    if meanqual_check:
+        log_out.append("Number of Sequences with Mean window qual score below minimum of  {}: {}\m".format(
+                       min_qual_score,meanqual_check))
+    if homopolymer_check:
+        log_out.append("Number of Sequences where Max homopolymer run exceeds limit of {}: {}\n".format(
+            max_homopolymer,homopolymer_check))
+
     log_out.append('Num mismatches in primer exceeds limit of %s: %d\n' %
                    (max_primer_mm, primer_mismatch_count))
     if reverse_primers == "truncate_only":
@@ -1150,7 +1310,7 @@ def preprocess(fasta_files, qual_files, mapping_file,
                reverse_primer_mismatches=0,
                record_qual_scores=False, discard_bad_windows=False,
                median_length_filtering=None, added_demultiplex_field=None,
-               truncate_ambi_bases=False):
+               truncate_ambi_bases=False, ncpus=1):
     """
     Preprocess barcoded libraries, e.g. from 454.
 
@@ -1245,6 +1405,8 @@ def preprocess(fasta_files, qual_files, mapping_file,
 
     truncate_ambi_bases: (default False) If enabled, will truncate the
     sequence at the first "N" character.
+
+    number_cpus: (default 1 ) number of cpus to use
 
     Result:
     in dir_prefix, writes the following files:
@@ -1370,8 +1532,9 @@ def preprocess(fasta_files, qual_files, mapping_file,
     else:
         qual_mappings = {}
 
-    # make filters
-    filters = []
+    # make filters; set their values to none
+    check_trim=check_ambig=check_qual=check_meanqual=check_homopolymer = None
+
     # seq len filter depends on whether we're including the barcode, if
     # median_length_filtering turned on, no length filtering.
     if not median_length_filtering:
@@ -1388,42 +1551,20 @@ def preprocess(fasta_files, qual_files, mapping_file,
                 barcode_len = max(barcode_length_check)
 
             trim = barcode_len + primer_seq_len
-            filters.append(SeqQualBad(
-                'Length outside bounds of %s and %s' % (
-                    min_seq_len,
-                    max_seq_len),
-                lambda id_, seq, qual:
-                not (min_seq_len <= len(seq) - trim <= max_seq_len)))
+            check_trim = make_trim_filter(min_seq_len,max_seq_len,trim)
         else:
-            filters.append(SeqQualBad(
-                'Length outside bounds of %s and %s' % (
-                    min_seq_len,
-                    max_seq_len),
-                lambda id_, seq, qual: not (min_seq_len <= len(seq) <= max_seq_len)))
+            check_trim = make_trim_filter(min_seq_len,max_seq_len, trim=0)
 
     if not truncate_ambi_bases:
-        filters.append(SeqQualBad(
-            'Num ambiguous bases exceeds limit of %s' % max_ambig,
-            lambda id_, seq, qual: count_ambig(seq) > max_ambig))
+        check_ambig = make_ambig_filter(max_ambig)
 
     if qual_mappings:
-        filters.append(QualMissing)
-        filters.append(SeqQualBad(
-            'Mean qual score below minimum of %s' % min_qual_score,
-            lambda id_, seq, qual: mean(qual) < min_qual_score))
-    """if qual_score_window:
-            filters.append(SeqQualBad('Mean window qual score below '+\
-                            'minimum of %s' % min_qual_score,
-                                      lambda id_, seq, qual: \
-             not check_window_qual_scores(qual, qual_score_window, \
-             min_qual_score))) """
+        check_qual = make_qual_filter()
+        check_meanqual= make_meanqual_filter(min_qual_score)
 
     # Changed this to check entire sequence after barcode-could cause issue
     # if barcode-linker-primer have long homopolymers though.
-    filters.append(SeqQualBad(
-        'Max homopolymer run exceeds limit of %s' % max_homopolymer,
-        lambda id_, seq, qual: seq_exceeds_homopolymers(
-            seq[barcode_len:], max_homopolymer)))
+    check_homopolymer = make_homopolymer_filter(max_homopolymer, barcode_len)
 
     # Check seqs and write out
     fasta_out = open(dir_prefix + '/' + 'seqs.fna.tmp', 'w+')
@@ -1436,15 +1577,20 @@ def preprocess(fasta_files, qual_files, mapping_file,
         starting_ix, valid_map, qual_mappings, filters, barcode_len,
         primer_seq_len, keep_primer, keep_barcode, barcode_type, max_bc_errors,
         retain_unassigned_reads) '''
-    log_stats, raw_lens, pre_lens, post_lens = check_seqs(fasta_out,
-                                                          fasta_files, starting_ix, valid_map, qual_mappings, filters,
-                                                          barcode_len, keep_primer, keep_barcode, barcode_type, max_bc_errors,
-                                                          retain_unassigned_reads, attempt_bc_correction,
-                                                          primer_seqs_lens, all_primers, max_primer_mm, disable_primer_check,
-                                                          reverse_primers, rev_primers, qual_out, qual_score_window,
-                                                          discard_bad_windows, min_qual_score, min_seq_len,
-                                                          median_length_filtering, added_demultiplex_field,
-                                                          reverse_primer_mismatches, truncate_ambi_bases)
+    log_stats, raw_lens, pre_lens, post_lens = \
+        check_seqs(fasta_out=fasta_out, fasta_files=fasta_files, starting_ix=starting_ix, valid_map=valid_map,
+                   qual_mappings=qual_mappings, keep_primer=keep_primer, barcode_len=barcode_len,
+                   keep_barcode=keep_barcode, barcode_type=barcode_type, max_bc_errors=max_bc_errors,
+                   retain_unassigned_reads=retain_unassigned_reads, attempt_bc_correction=attempt_bc_correction,
+                   primer_seqs_lens=primer_seqs_lens, all_primers=all_primers, max_primer_mm=max_primer_mm,
+                   disable_primer_check=disable_primer_check, reverse_primers=reverse_primers,
+                   rev_primers=rev_primers,qual_out=qual_out, qual_score_window=qual_score_window,
+                   discard_bad_windows=discard_bad_windows,min_qual_score=min_qual_score, min_seq_len=min_seq_len,
+                   median_length_filtering=median_length_filtering, added_demultiplex_field=added_demultiplex_field,
+                   reverse_primer_mismatches=reverse_primer_mismatches, truncate_ambi_bases=truncate_ambi_bases,
+                   ncpus=ncpus, check_trim=check_trim, check_ambig=check_ambig, check_qual=check_qual,
+                   check_meanqual=check_meanqual, check_homopolymer=check_homopolymer,max_seq_len=max_seq_len,
+                   max_homopolymer=max_homopolymer, max_ambig=max_ambig)
 
     # Write log file
     log_file = open(dir_prefix + '/' + "split_library_log.txt", 'w+')

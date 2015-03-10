@@ -327,7 +327,10 @@ script_info['optional_options'] = [
                 action='store_true', default=False,
                 help='Enable to truncate at the first "N" character encountered in ' +
                 'the sequences.  This will disable testing for ambiguous bases ' +
-                '(-a option) [default: %default]')]
+                '(-a option) [default: %default]'),
+
+    make_option('-N', '--number_cpus', default=1,  type='int',
+                help='how many cpus to use [default: %default]')]
 
 script_info['version'] = __version__
 
@@ -405,7 +408,8 @@ def main():
                discard_bad_windows=opts.discard_bad_windows,
                median_length_filtering=opts.median_length_filtering,
                added_demultiplex_field=opts.added_demultiplex_field,
-               truncate_ambi_bases=opts.truncate_ambi_bases)
+               truncate_ambi_bases=opts.truncate_ambi_bases,
+               ncpus=opts.number_cpus)
 
 if __name__ == "__main__":
     main()
