@@ -26,6 +26,7 @@ from qiime.parse import is_casava_v180_or_later
 from qiime.hamming import decode_hamming_8
 from qiime.golay import decode_golay_12
 from qiime.util import qiime_open
+from qiime import barcode
 
 
 class FastqParseError(Exception):
@@ -157,10 +158,27 @@ def check_header_match_180_or_later(header1, header2):
 
     return True
 
-BARCODE_DECODER_LOOKUP = {
-    'golay_12': decode_golay_12,
-    #'hamming_8':decode_hamming_8,
-}
+def get_barcode_fn(barcodetype):
+    """
+    Hackish script to allow barcoding to work. If the barcode is an integer it will attempt
+    error correction. If it is golay_12 it will use the inbuilt correction. Otherwise no correction.
+    """
+    try:
+        barcode = int(barcodetype)
+        return 'simple'
+    except:
+        if barcodetype == 'golay_12':
+            return decode_golay_12,
+        else:
+            return None
+
+
+# BARCODE_DECODER_LOOKUP = {
+#     'golay_12': decode_golay_12,
+#     'simple': 'simple'
+#     #'hamming_8':decode_hamming_8,
+# }
+
 
 
 def correct_barcode(barcode, barcode_to_sample_id, correction_fn):
@@ -183,15 +201,32 @@ def correct_barcode(barcode, barcode_to_sample_id, correction_fn):
         # a sample ID, because we're not correcting barcodes, or because
         # it contains an 'N' character
         return 0, barcode, False, sample_id
-    else:
-        # correct the barcode
-        corrected_barcode, num_errors = correction_fn(barcode)
+
+    elif correction_fn == 'simple':
+        # Basic Barcode Correction Using qiime.barcode.correct_barcode()
+        # this requires a dictionar
+        allbarcodes = barcode_to_sample_id.keys()
+        corrected_barcode, num_errors = barcode.correct_barcode(barcode, allbarcodes)
+
         try:
             sample_id = barcode_to_sample_id[corrected_barcode]
         except KeyError:
             sample_id = None
 
         return num_errors, corrected_barcode, True, sample_id
+
+    else:
+        corrected_barcode, num_errors = correction_fn(barcode)
+        # correct the barcode
+        try:
+            sample_id = barcode_to_sample_id[corrected_barcode]
+        except KeyError:
+            sample_id = None
+
+        return num_errors, corrected_barcode, True, sample_id
+
+
+
 
 
 def process_fastq_single_end_read_file_no_barcode(

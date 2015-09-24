@@ -21,10 +21,11 @@ from skbio.format.sequences import format_fastq_record
 from qiime.util import parse_command_line_parameters, make_option, gzip_open
 from qiime.parse import parse_mapping_file, parse_items
 from qiime.split_libraries_fastq import (process_fastq_single_end_read_file,
-                                         BARCODE_DECODER_LOOKUP, process_fastq_single_end_read_file_no_barcode)
+                                         get_barcode_fn, process_fastq_single_end_read_file_no_barcode)
 from qiime.split_libraries import check_map
 from qiime.split_libraries_fastq import get_illumina_qual_chars
 from qiime.golay import get_invalid_golay_barcodes
+from qiime.barcode import correct_barcode
 
 script_info = {}
 
@@ -242,7 +243,7 @@ def main():
                             'than 0 and less than or equal to 1. You passed '
                             '%1.5f.' % min_per_read_length_fraction)
 
-    barcode_correction_fn = BARCODE_DECODER_LOOKUP.get(barcode_type, None)
+    barcode_correction_fn = get_barcode_fn(barcode_type)
 
     if len(mapping_fps) == 1 and len(sequence_read_fps) > 1:
         mapping_fps = mapping_fps * len(sequence_read_fps)
@@ -372,11 +373,10 @@ def main():
                 log_f=log_f, histogram_f=histogram_f,
                 phred_offset=phred_offset)
 
-
         # If files are being split, they will be appended to.
         #  To ensure they are writing to a clean file, and delete preexisting files
         if split_files:
-            for sample_id in sample_ids:
+            for sample_id in barcode_to_sample_id.values():
                 samplefiles = [ "{}/{}_seqs.fna.incomplete".format(output_dir, sample_id),
                                 "{}/{}_seqs.qual.incomplete".format(output_dir, sample_id),
                                 "{}/{}_seqs.fastq.incomplete".format(output_dir, sample_id) ]
@@ -421,7 +421,7 @@ def main():
         rename(output_fastq_fp_temp, output_fastq_fp)
 
     if split_files:
-        for sample_id in sample_ids:
+        for sample_id in barcode_to_sample_id.values():
             try:
                 rename("%s/%s_seqs.fna.incomplete" % (output_dir, sample_id),
                        "%s/%s_seqs.fna" % (output_dir, sample_id))
