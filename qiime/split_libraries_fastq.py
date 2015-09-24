@@ -26,7 +26,7 @@ from qiime.parse import is_casava_v180_or_later
 from qiime.hamming import decode_hamming_8
 from qiime.golay import decode_golay_12
 from qiime.util import qiime_open
-from qiime import barcode
+from qiime import barcode as qbarcode
 
 
 class FastqParseError(Exception):
@@ -206,7 +206,7 @@ def correct_barcode(barcode, barcode_to_sample_id, correction_fn):
         # Basic Barcode Correction Using qiime.barcode.correct_barcode()
         # this requires a dictionar
         allbarcodes = barcode_to_sample_id.keys()
-        corrected_barcode, num_errors = barcode.correct_barcode(barcode, allbarcodes)
+        corrected_barcode, num_errors = qbarcode.correct_barcode(barcode, allbarcodes)
 
         try:
             sample_id = barcode_to_sample_id[corrected_barcode]
